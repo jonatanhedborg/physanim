@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build extension zip
+        id: build
+        run: |
+          set -euo pipefail
+          version=$(grep -oP '^version\s*=\s*"\K[^"]+' blender_manifest.toml)
+          zip="physanim-${version}.zip"
+          # git archive only includes tracked files and honours export-ignore
+          # in .gitattributes, so build artifacts can never leak into the zip.
+          git archive --format=zip -o "$zip" HEAD
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+          echo "Built $zip with contents:"
+          python3 -c "import zipfile; print('\n'.join(zipfile.ZipFile('$zip').namelist()))"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: physanim-extension
+          path: ${{ steps.build.outputs.zip }}
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          zip="${{ steps.build.outputs.zip }}"
+          gh release create "$tag" "$zip" --title "$tag" --generate-notes \
+            || gh release upload "$tag" "$zip" --clobber

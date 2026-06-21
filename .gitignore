@@ -1,0 +1,7 @@
+# Build artifacts
+*.zip
+dist/
+
+# Python
+__pycache__/
+*.py[cod]

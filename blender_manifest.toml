@@ -1,0 +1,29 @@
+schema_version = "1.0.0"
+
+id = "physanim"
+version = "1.0.0"
+name = "PhysAnim"
+tagline = "Preview and keyframe projectile motion for objects"
+maintainer = "Jonatan Hedborg <jonatan.hedborg@gmail.com>"
+type = "add-on"
+website = "https://github.com/jonatanhedborg/physanim"
+
+# Targets Blender 4.2+ (tested on 5.1). Extensions require 4.2 or newer.
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+tags = ["Animation", "Physics"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/.github/",
+  "/*.zip",
+  ".gitignore",
+  ".gitattributes",
+  "justfile",
+]
