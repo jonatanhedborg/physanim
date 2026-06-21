@@ -17,12 +17,13 @@ Tested on **Blender 5.1** (requires 4.2+, ships as an extension).
 
 It's packaged as a Blender extension.
 
-1. `Edit ▸ Preferences ▸ Get Extensions ▸ (top-right ▾) ▸ Install from Disk…`
-2. Pick this folder, or a zip of it (`blender_manifest.toml` must be at the root).
-3. Enable it if it isn't already.
+1. Download `physanim-<version>.zip` from the
+   [latest release](https://github.com/jonatanhedborg/physanim/releases/latest).
+2. In Blender: `Edit ▸ Preferences ▸ Get Extensions ▸ (top-right ▾) ▸ Install from Disk…`
+3. Select the downloaded zip.
+4. Enable it if it isn't already.
 
-Alternatively, drag the folder/zip into Blender, or for quick iteration symlink
-this folder into your user extensions directory.
+Alternatively, drag the zip into Blender.
 
 ## Use
 
