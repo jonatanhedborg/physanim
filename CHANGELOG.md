@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.0] - 2026-06-22
+
+### Added
+- Ghost preview: a toggle to show the object's outline (evaluated-mesh
+  wireframe, bounding-box fallback) at the predicted location instead of a
+  marker dot.
+- Air resistance: optional aerodynamic drag from real parameters (mass, drag
+  coefficient with shape presets, cross-section auto-estimated from bounds or
+  manual, air density), with a terminal-speed readout.
+- Bounce: optional reflection of the object's origin off a configurable
+  horizontal ground plane, with a restitution factor and multiple bounces.
+
+### Changed
+- The trajectory is now a general simulation: plain gravity keeps the exact
+  closed-form parabola, while drag or bounce use a numerical integrator for the
+  preview, marker, ghost, and bake.
+
 ## [1.0.0] - 2026-06-22
 
 Initial public release.

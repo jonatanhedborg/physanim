@@ -1,15 +1,20 @@
 # PhysAnim
 
 A Blender animation helper. Give the active object an initial velocity and a
-gravity, preview the projectile trajectory live in the viewport, scrub the
-prediction point with the scroll wheel, and bake the result into location
-keyframes.
+gravity, preview the trajectory live in the viewport, scrub the prediction
+point with the scroll wheel, and bake the result into location keyframes.
+Optional air resistance and ground bouncing make the motion as simple or as
+physical as you need.
 
-Physics is pure projectile motion:
+With no air resistance the motion is the exact projectile parabola:
 
 ```
 p(t) = p0 + v0 * t + 0.5 * g * t^2
 ```
+
+Enabling air resistance applies the aerodynamic drag equation
+(`a = -(0.5*rho*Cd*A/m) * |v|*v`), which has no closed form and is solved by
+numerical integration. Bouncing reflects the object off a ground plane.
 
 Tested on **Blender 5.1** (requires 4.2+, ships as an extension).
 
@@ -32,7 +37,8 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
 
 1. Select an object.
 2. Click **Show Preview**. An orange handle and an orange trajectory arc appear,
-   with a green dot at the prediction point.
+   with a green dot at the prediction point. The ghost button next to it swaps
+   that dot for a **ghost outline** of the object at the predicted location.
 3. Set the launch:
    - **Drag the orange handle** in the viewport to aim; the handle sits at
      `object + velocity`, so dragging it towards a target updates the
@@ -44,24 +50,34 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
      driven from the locked speed, and editing **Launch Speed** rescales the
      velocity while keeping its direction.
    - Adjust **Gravity** if needed (default `0, 0, -9.81`).
-4. Choose how far ahead to look:
+4. Optionally enable physics:
+   - **Air Resistance**: set the **Mass**, pick a **Shape** preset (or a custom
+     drag coefficient), give a cross-section (**Area from Bounds** estimates it
+     from the object, or enter it), and set **Air Density**. A terminal-speed
+     readout shows the combined effect.
+   - **Bounce**: set the **Ground Height** and **Bounciness** to bounce the
+     object's origin off a horizontal plane (multiple decaying bounces).
+5. Choose how far ahead to look:
    - Drag **Prediction Time**, or
    - Click **Scrub Prediction** and roll the **scroll wheel** (Shift = fine,
      Ctrl = coarse). Enter/click confirms, Esc cancels.
    The predicted frame is shown in the panel and next to the green marker.
-5. Click **Apply as Keyframes** to insert location keyframes from the current
+6. Click **Apply as Keyframes** to insert location keyframes from the current
    frame through the predicted frame.
 
 ### Notes & options
 
 - **Handle Distance** changes only how far away the drag handle sits per m/s
   (visual convenience); it does not affect the simulation.
-- **Path Steps** controls how smooth the drawn arc looks.
-- **Keyframe Every** = `1` keys every frame, giving an exact parabola. Larger
-  values insert sparser keys (interpolation between them won't be perfectly
-  parabolic).
+- **Path Steps** controls how smooth the drawn arc looks (plain-gravity only;
+  with drag or bounce the path is drawn from the integration steps).
+- **Keyframe Every** = `1` keys every frame and is recommended. Larger values
+  insert sparser keys, whose interpolation won't follow the true curve, which
+  matters most with drag or bounce.
 - Baking starts at the **current scene frame** using the object's current
   position as the first keyframe.
-- Velocity and gravity are interpreted in **world space**. If the object is
-  parented, keyframes are written in world space and a warning is shown, so the
-  result may not match the parent's transform.
+- Velocity, gravity and the ground plane are in **world space**. If the object
+  is parented, keyframes are written in world space and a warning is shown, so
+  the result may not match the parent's transform.
+- **Bounce** reflects the object's **origin** off the ground plane, so set the
+  height to suit the object's pivot/size.
