@@ -93,8 +93,13 @@ def _drag_k(props, ob):
     return 0.5 * props.air_density * props.drag_cd * area / mass
 
 
-def _integrate(p0, v0, a_const, drag_k, t_end):
+def _integrate(p0, v0, a_const, drag_k, t_end, bounce=None):
     """Semi-implicit (symplectic) Euler integration with quadratic drag.
+
+    ``bounce`` is ``None`` or ``(ground_z, restitution)``: when the point crosses
+    below the ground plane while moving down, it is clamped to the plane and its
+    vertical velocity is reflected and scaled by restitution (multiple bounces
+    fall out of the loop naturally).
 
     Returns ``(points, dt)`` where points are sampled uniformly in time.
     """
@@ -109,6 +114,11 @@ def _integrate(p0, v0, a_const, drag_k, t_end):
     for _ in range(n):
         v = v + (a_const - (drag_k * v.length) * v) * dt
         p = p + v * dt
+        if bounce is not None:
+            ground_z, restitution = bounce
+            if p.z < ground_z and v.z < 0.0:
+                p.z = ground_z
+                v.z = -v.z * restitution
         pts.append(p.copy())
     return pts, dt
 
@@ -133,8 +143,9 @@ def build_trajectory(p0, v0, props, t_end, drag_k=0.0):
     """
     t_end = max(t_end, 1e-6)
     a_const = Vector(props.gravity)
+    bounce = (props.ground_height, props.restitution) if props.bounce_enabled else None
 
-    if drag_k <= 0.0:
+    if drag_k <= 0.0 and bounce is None:
         def sampler(t, _p0=p0, _v0=v0, _a=a_const):
             return trajectory_point(_p0, _v0, _a, t)
 
@@ -142,7 +153,7 @@ def build_trajectory(p0, v0, props, t_end, drag_k=0.0):
         draw = [sampler(t_end * i / n) for i in range(n + 1)]
         return draw, sampler
 
-    pts, dt = _integrate(p0, v0, a_const, drag_k, t_end)
+    pts, dt = _integrate(p0, v0, a_const, drag_k, t_end, bounce)
 
     def sampler(t, _pts=pts, _dt=dt):
         return _sample_path(_pts, _dt, t)
@@ -358,6 +369,29 @@ class PHYS_PG_props(PropertyGroup):
         default=1.225,
         min=0.0,
         soft_max=2.0,
+        precision=3,
+        update=_redraw_update,
+    )
+    bounce_enabled: BoolProperty(
+        name="Bounce",
+        description="Bounce the object's origin off a horizontal ground plane",
+        default=False,
+        update=_redraw_update,
+    )
+    ground_height: FloatProperty(
+        name="Ground Height",
+        description="Z height of the ground plane the object's origin bounces on",
+        default=0.0,
+        unit='LENGTH',
+        update=_redraw_update,
+    )
+    restitution: FloatProperty(
+        name="Bounciness",
+        description="Fraction of speed kept after each bounce "
+                    "(1 = perfectly elastic, 0 = no bounce)",
+        default=0.5,
+        min=0.0,
+        max=1.0,
         precision=3,
         update=_redraw_update,
     )
@@ -890,6 +924,12 @@ class PHYS_PT_panel(Panel):
             a = Vector(props.gravity)
             if k > 1e-9 and a.length > 1e-9:
                 box.label(text="Terminal speed: {:.1f} m/s".format((a.length / k) ** 0.5))
+
+        box = layout.box()
+        box.prop(props, "bounce_enabled")
+        if props.bounce_enabled:
+            box.prop(props, "ground_height")
+            box.prop(props, "restitution", slider=True)
 
         layout.prop(props, "prediction_time")
 
