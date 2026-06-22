@@ -439,6 +439,9 @@ class PHYS_PG_props(PropertyGroup):
 _handle_view = None
 _handle_px = None
 
+# Alpha multiplier for the parts of the overlay hidden behind scene geometry.
+OCCLUDED_ALPHA = 0.15
+
 
 def _active_props(context):
     ob = context.object
@@ -508,37 +511,48 @@ def _draw_geometry():
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
-    prev_blend = gpu.state.blend_get()
-    gpu.state.blend_set('ALPHA')
-    gpu.state.line_width_set(2.0)
-    gpu.state.point_size_set(11.0)
-
-    # Trajectory arc.
-    batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": pts})
-    shader.bind()
-    shader.uniform_float("color", (1.0, 0.62, 0.12, 0.95))
-    batch.draw(shader)
-
-    # Start point.
-    batch_start = batch_for_shader(shader, 'POINTS', {"pos": [p0.to_tuple()]})
-    shader.uniform_float("color", (0.95, 0.95, 0.95, 1.0))
-    batch_start.draw(shader)
-
-    # Prediction point: a ghost outline of the object, or a marker dot.
+    # Build the drawables: (batch, base_color, line_width). Points use a
+    # line_width of 0 (point size is set separately).
+    arc = batch_for_shader(shader, 'LINE_STRIP', {"pos": pts})
+    start = batch_for_shader(shader, 'POINTS', {"pos": [p0.to_tuple()]})
+    drawables = [
+        (arc, (1.0, 0.62, 0.12, 0.95), 2.0),
+        (start, (0.95, 0.95, 0.95, 1.0), 0.0),
+    ]
     if props.ghost:
         ghost_mat = ob.matrix_world.copy()
         ghost_mat.translation = marker_vec
         segs = _ghost_segments(ob, ghost_mat, context)
         if segs:
-            gpu.state.line_width_set(1.5)
-            batch_ghost = batch_for_shader(shader, 'LINES', {"pos": segs})
-            shader.uniform_float("color", (0.15, 0.95, 0.35, 0.7))
-            batch_ghost.draw(shader)
+            ghost = batch_for_shader(shader, 'LINES', {"pos": segs})
+            drawables.append((ghost, (0.15, 0.95, 0.35, 0.8), 1.5))
     else:
-        batch_marker = batch_for_shader(shader, 'POINTS', {"pos": [marker_vec.to_tuple()]})
-        shader.uniform_float("color", (0.15, 0.95, 0.35, 1.0))
-        batch_marker.draw(shader)
+        marker = batch_for_shader(shader, 'POINTS', {"pos": [marker_vec.to_tuple()]})
+        drawables.append((marker, (0.15, 0.95, 0.35, 1.0), 0.0))
 
+    prev_blend = gpu.state.blend_get()
+    prev_depth = gpu.state.depth_test_get()
+    gpu.state.blend_set('ALPHA')
+    gpu.state.point_size_set(11.0)
+    gpu.state.depth_mask_set(False)  # test against the scene depth, don't write
+    shader.bind()
+
+    def render(alpha):
+        for batch, color, width in drawables:
+            if width:
+                gpu.state.line_width_set(width)
+            shader.uniform_float("color", (color[0], color[1], color[2], color[3] * alpha))
+            batch.draw(shader)
+
+    # Visible (in front of geometry) at full strength, occluded faded out so the
+    # intersection with geometry reads as a bright-to-faint transition.
+    gpu.state.depth_test_set('LESS_EQUAL')
+    render(1.0)
+    gpu.state.depth_test_set('GREATER')
+    render(OCCLUDED_ALPHA)
+
+    gpu.state.depth_test_set(prev_depth)
+    gpu.state.depth_mask_set(True)
     gpu.state.line_width_set(1.0)
     gpu.state.point_size_set(1.0)
     gpu.state.blend_set(prev_blend)
@@ -595,7 +609,8 @@ def _sphere_shape(radius=1.0, segs=16, rings=8):
         for i in range(segs):
             a, b = p(i, j), p(i + 1, j)
             c, d = p(i + 1, j + 1), p(i, j + 1)
-            verts += [a, b, c, a, c, d]
+            # Outward-facing (CCW) winding so back-face culling renders solid.
+            verts += [a, c, b, a, d, c]
     return verts
 
 
@@ -625,7 +640,16 @@ class PHYS_GT_velocity_handle(Gizmo):
             self.custom_shape = self.new_custom_shape('TRIS', _sphere_shape())
 
     def draw(self, context):
+        # Always on top and solid: depth test off so the handle isn't occluded
+        # by geometry, back-face culling so the sphere reads as solid (rather
+        # than a tangle of overlapping triangles).
+        state = gpu.state
+        prev_test = state.depth_test_get()
+        state.depth_test_set('NONE')
+        state.face_culling_set('BACK')
         self.draw_custom_shape(self.custom_shape)
+        state.face_culling_set('NONE')
+        state.depth_test_set(prev_test)
 
     def draw_select(self, context, select_id):
         self.draw_custom_shape(self.custom_shape, select_id=select_id)
