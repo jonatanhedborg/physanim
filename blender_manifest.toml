@@ -18,12 +18,11 @@ license = [
 tags = ["Animation", "Physics"]
 
 [build]
-paths_exclude_pattern = [
-  "__pycache__/",
-  "/.git/",
-  "/.github/",
-  "/*.zip",
-  ".gitignore",
-  ".gitattributes",
-  "justfile",
+# Allowlist: only these files ship in the package, so local-only files
+# (build tooling, scratch notes, etc.) are never bundled.
+paths = [
+  "__init__.py",
+  "LICENSE",
+  "README.md",
+  "CHANGELOG.md",
 ]

@@ -1,10 +1,10 @@
-# Physics Throw Predictor — build tasks
+# PhysAnim — build tasks
 
 # List available recipes
 default:
     @just --list
 
-# Build the installable extension zip (e.g. physics_throw_predictor-<version>.zip)
+# Build the installable extension zip (e.g. physanim-<version>.zip)
 build:
     blender --command extension build
 
