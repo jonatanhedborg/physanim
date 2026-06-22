@@ -22,6 +22,7 @@ from bpy.props import (
     FloatProperty,
     IntProperty,
     BoolProperty,
+    EnumProperty,
     PointerProperty,
 )
 from gpu_extras.batch import batch_for_shader
@@ -49,6 +50,108 @@ def sample_trajectory(p0, v0, g, t_end, segments):
         t = t_end * i / segments
         pts.append(trajectory_point(p0, v0, g, t))
     return pts
+
+
+# Fixed integration step and a hard cap on step count, used when the motion has
+# no closed form (drag, and later bounce). 240 Hz is plenty for preview/bake.
+SIM_DT = 1.0 / 240.0
+SIM_MAX_STEPS = 20000
+
+
+# Drag coefficients (Cd) for common shapes, used by the shape preset.
+_CD_PRESETS = {
+    'SPHERE': 0.47,
+    'CUBE': 1.05,
+    'CYLINDER': 0.82,
+    'STREAMLINED': 0.04,
+    'FLAT_PLATE': 1.28,
+}
+
+
+def _auto_cross_section(ob):
+    """Estimate a reference cross-sectional area (m^2) from the object bounds.
+
+    Uses the mean of the three bounding-box face areas, so it's independent of
+    which way the object happens to be moving.
+    """
+    d = ob.dimensions
+    return (d.x * d.y + d.y * d.z + d.z * d.x) / 3.0
+
+
+def _drag_k(props, ob):
+    """Effective quadratic-drag coefficient k in ``a = -k*|v|*v``.
+
+    From the aerodynamic drag equation: ``k = 0.5 * rho * Cd * A / m``.
+    Returns 0 when air resistance is disabled (closed-form fast path).
+    """
+    if not props.drag_enabled:
+        return 0.0
+    area = props.cross_section
+    if props.auto_cross_section and ob is not None:
+        area = _auto_cross_section(ob)
+    mass = max(props.mass, 1e-6)
+    return 0.5 * props.air_density * props.drag_cd * area / mass
+
+
+def _integrate(p0, v0, a_const, drag_k, t_end):
+    """Semi-implicit (symplectic) Euler integration with quadratic drag.
+
+    Returns ``(points, dt)`` where points are sampled uniformly in time.
+    """
+    dt = SIM_DT
+    n = int(t_end / dt) + 1
+    if n > SIM_MAX_STEPS:
+        n = SIM_MAX_STEPS
+        dt = t_end / n
+    p = p0.copy()
+    v = v0.copy()
+    pts = [p.copy()]
+    for _ in range(n):
+        v = v + (a_const - (drag_k * v.length) * v) * dt
+        p = p + v * dt
+        pts.append(p.copy())
+    return pts, dt
+
+
+def _sample_path(pts, dt, t):
+    """Linear-interpolated position at time ``t`` along an integrated path."""
+    if t <= 0.0:
+        return pts[0].copy()
+    fi = t / dt
+    i = int(fi)
+    if i >= len(pts) - 1:
+        return pts[-1].copy()
+    return pts[i].lerp(pts[i + 1], fi - i)
+
+
+def build_trajectory(p0, v0, props, t_end, drag_k=0.0):
+    """Return ``(draw_points, sampler)`` for the trajectory over ``[0, t_end]``.
+
+    ``draw_points`` is a list of ``Vector`` for the viewport polyline; ``sampler``
+    is ``f(t) -> Vector`` giving the position at time ``t``. With no drag the
+    motion uses the exact closed form; air resistance uses the integrator.
+    """
+    t_end = max(t_end, 1e-6)
+    a_const = Vector(props.gravity)
+
+    if drag_k <= 0.0:
+        def sampler(t, _p0=p0, _v0=v0, _a=a_const):
+            return trajectory_point(_p0, _v0, _a, t)
+
+        n = max(int(props.resolution), 2)
+        draw = [sampler(t_end * i / n) for i in range(n + 1)]
+        return draw, sampler
+
+    pts, dt = _integrate(p0, v0, a_const, drag_k, t_end)
+
+    def sampler(t, _pts=pts, _dt=dt):
+        return _sample_path(_pts, _dt, t)
+
+    stride = max(1, len(pts) // 512)
+    draw = pts[::stride]
+    if draw[-1] is not pts[-1]:
+        draw.append(pts[-1])
+    return draw, sampler
 
 
 def scene_fps(scene):
@@ -129,6 +232,14 @@ def _update_locked_speed(self, context):
     _tag_view3d_redraw(context)
 
 
+def _update_cd_preset(self, context):
+    # Selecting a shape fills in its drag coefficient; 'CUSTOM' leaves it alone.
+    cd = _CD_PRESETS.get(self.cd_preset)
+    if cd is not None:
+        self.drag_cd = cd
+    _tag_view3d_redraw(context)
+
+
 # --------------------------------------------------------------------------- #
 # Properties (stored per object)
 # --------------------------------------------------------------------------- #
@@ -181,6 +292,73 @@ class PHYS_PG_props(PropertyGroup):
         subtype='ACCELERATION',
         unit='ACCELERATION',
         default=(0.0, 0.0, -9.81),
+        update=_redraw_update,
+    )
+    drag_enabled: BoolProperty(
+        name="Air Resistance",
+        description="Apply aerodynamic drag: a = -(0.5*rho*Cd*A/m) * |v|*v",
+        default=False,
+        update=_redraw_update,
+    )
+    mass: FloatProperty(
+        name="Mass",
+        description="Object mass used by the drag equation",
+        default=1.0,
+        min=1e-4,
+        soft_max=100.0,
+        step=10,
+        precision=3,
+        unit='MASS',
+        update=_redraw_update,
+    )
+    cd_preset: EnumProperty(
+        name="Shape",
+        description="Fill in a typical drag coefficient for a common shape",
+        items=[
+            ('SPHERE', "Sphere", "Cd ~ 0.47"),
+            ('CUBE', "Cube", "Cd ~ 1.05"),
+            ('CYLINDER', "Cylinder", "Cd ~ 0.82"),
+            ('STREAMLINED', "Streamlined", "Cd ~ 0.04"),
+            ('FLAT_PLATE', "Flat Plate", "Cd ~ 1.28"),
+            ('CUSTOM', "Custom", "Use the drag coefficient set below"),
+        ],
+        default='SPHERE',
+        update=_update_cd_preset,
+    )
+    drag_cd: FloatProperty(
+        name="Drag Coefficient",
+        description="Dimensionless drag coefficient (Cd)",
+        default=0.47,
+        min=0.0,
+        soft_max=2.0,
+        step=1,
+        precision=3,
+        update=_redraw_update,
+    )
+    auto_cross_section: BoolProperty(
+        name="Area from Bounds",
+        description="Estimate the reference cross-sectional area from the object's "
+                    "bounding box, instead of entering it manually",
+        default=True,
+        update=_redraw_update,
+    )
+    cross_section: FloatProperty(
+        name="Cross-section",
+        description="Reference cross-sectional area facing the airflow",
+        default=0.05,
+        min=1e-6,
+        soft_max=10.0,
+        precision=4,
+        unit='AREA',
+        update=_redraw_update,
+    )
+    air_density: FloatProperty(
+        name="Air Density",
+        description="Air density in kg/m^3 (sea level is about 1.225)",
+        default=1.225,
+        min=0.0,
+        soft_max=2.0,
+        precision=3,
         update=_redraw_update,
     )
     prediction_time: FloatProperty(
@@ -288,11 +466,11 @@ def _draw_geometry():
 
     p0 = ob.matrix_world.translation.copy()
     v0 = Vector(props.velocity)
-    g = Vector(props.gravity)
     t_end = max(props.prediction_time, 1e-6)
 
-    pts = [p.to_tuple() for p in sample_trajectory(p0, v0, g, t_end, props.resolution)]
-    marker_vec = trajectory_point(p0, v0, g, t_end)
+    draw_pts, sampler = build_trajectory(p0, v0, props, t_end, _drag_k(props, ob))
+    pts = [p.to_tuple() for p in draw_pts]
+    marker_vec = sampler(t_end)
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
@@ -345,9 +523,9 @@ def _draw_text():
 
     p0 = ob.matrix_world.translation.copy()
     v0 = Vector(props.velocity)
-    g = Vector(props.gravity)
     t_end = max(props.prediction_time, 1e-6)
-    marker = trajectory_point(p0, v0, g, t_end)
+    _, sampler = build_trajectory(p0, v0, props, t_end, _drag_k(props, ob))
+    marker = sampler(t_end)
 
     co = location_3d_to_region_2d(region, rv3d, marker)
     if co is None:
@@ -603,7 +781,6 @@ class PHYS_OT_apply(Operator):
         start_frame = scene.frame_current
         p0 = ob.matrix_world.translation.copy()
         v0 = Vector(props.velocity)
-        g = Vector(props.gravity)
         t_end = props.prediction_time
 
         if t_end <= 0.0:
@@ -630,9 +807,10 @@ class PHYS_OT_apply(Operator):
                 "the baked path is mixed with them.".format(start_frame, end_frame),
             )
 
+        _, sampler = build_trajectory(p0, v0, props, t_end, _drag_k(props, ob))
         for fr in frames:
             t = (fr - start_frame) / fps
-            world = trajectory_point(p0, v0, g, t)
+            world = sampler(t)
             if ob.parent is not None:
                 mw = ob.matrix_world.copy()
                 mw.translation = world
@@ -693,6 +871,25 @@ class PHYS_PT_panel(Panel):
 
         col = layout.column(align=True)
         col.prop(props, "gravity")
+
+        box = layout.box()
+        box.prop(props, "drag_enabled")
+        if props.drag_enabled:
+            box.prop(props, "mass")
+            box.prop(props, "cd_preset")
+            row = box.row()
+            row.enabled = props.cd_preset == 'CUSTOM'
+            row.prop(props, "drag_cd")
+            box.prop(props, "auto_cross_section")
+            if props.auto_cross_section:
+                box.label(text="Area: {:.3f} m²".format(_auto_cross_section(ob)))
+            else:
+                box.prop(props, "cross_section")
+            box.prop(props, "air_density")
+            k = _drag_k(props, ob)
+            a = Vector(props.gravity)
+            if k > 1e-9 and a.length > 1e-9:
+                box.label(text="Terminal speed: {:.1f} m/s".format((a.length / k) ** 0.5))
 
         layout.prop(props, "prediction_time")
 
