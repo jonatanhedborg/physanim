@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] - 2026-06-22
+
+### Added
+- Occlusion-aware overlay: the trajectory and the prediction marker/ghost fade
+  out where they pass behind scene geometry, so the contact point is clear.
+- Hold Shift while dragging the velocity handle to move it slowly for fine
+  adjustment.
+
 ## [1.1.0] - 2026-06-22
 
 ### Added
