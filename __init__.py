@@ -140,6 +140,13 @@ class PHYS_PG_props(PropertyGroup):
         default=False,
         update=_redraw_update,
     )
+    ghost: BoolProperty(
+        name="Ghost",
+        description="Show a ghost outline of the object at the predicted location "
+                    "instead of a marker dot",
+        default=False,
+        update=_redraw_update,
+    )
     velocity: FloatVectorProperty(
         name="Initial Velocity",
         description="Launch velocity in world space (metres per second)",
@@ -231,6 +238,48 @@ def _active_props(context):
     return ob, props
 
 
+# Edge connectivity of Blender's 8-corner bound_box, for the ghost fallback.
+_BBOX_EDGES = ((0, 1), (1, 2), (2, 3), (3, 0),
+               (4, 5), (5, 6), (6, 7), (7, 4),
+               (0, 4), (1, 5), (2, 6), (3, 7))
+
+
+def _ghost_segments(ob, matrix, context):
+    """Line segments outlining ``ob`` placed at ``matrix``.
+
+    Uses the evaluated-mesh wireframe when the object can produce a mesh,
+    otherwise falls back to the bounding box (works for any object type).
+    Returns a flat list of vertex tuples for a ``'LINES'`` batch.
+    """
+    coords = []
+    ob_eval = None
+    me = None
+    try:
+        depsgraph = context.evaluated_depsgraph_get()
+        ob_eval = ob.evaluated_get(depsgraph)
+        me = ob_eval.to_mesh()
+    except (RuntimeError, AttributeError):
+        me = None
+
+    if me is not None and len(me.edges) > 0:
+        verts = [matrix @ v.co for v in me.vertices]
+        for e in me.edges:
+            a, b = e.vertices
+            coords.append(verts[a].to_tuple())
+            coords.append(verts[b].to_tuple())
+        ob_eval.to_mesh_clear()
+        return coords
+
+    if ob_eval is not None and me is not None:
+        ob_eval.to_mesh_clear()
+
+    corners = [matrix @ Vector(c) for c in ob.bound_box]
+    for a, b in _BBOX_EDGES:
+        coords.append(corners[a].to_tuple())
+        coords.append(corners[b].to_tuple())
+    return coords
+
+
 def _draw_geometry():
     context = bpy.context
     ob, props = _active_props(context)
@@ -243,7 +292,7 @@ def _draw_geometry():
     t_end = max(props.prediction_time, 1e-6)
 
     pts = [p.to_tuple() for p in sample_trajectory(p0, v0, g, t_end, props.resolution)]
-    marker = trajectory_point(p0, v0, g, t_end).to_tuple()
+    marker_vec = trajectory_point(p0, v0, g, t_end)
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
@@ -263,10 +312,20 @@ def _draw_geometry():
     shader.uniform_float("color", (0.95, 0.95, 0.95, 1.0))
     batch_start.draw(shader)
 
-    # Prediction marker.
-    batch_marker = batch_for_shader(shader, 'POINTS', {"pos": [marker]})
-    shader.uniform_float("color", (0.15, 0.95, 0.35, 1.0))
-    batch_marker.draw(shader)
+    # Prediction point: a ghost outline of the object, or a marker dot.
+    if props.ghost:
+        ghost_mat = ob.matrix_world.copy()
+        ghost_mat.translation = marker_vec
+        segs = _ghost_segments(ob, ghost_mat, context)
+        if segs:
+            gpu.state.line_width_set(1.5)
+            batch_ghost = batch_for_shader(shader, 'LINES', {"pos": segs})
+            shader.uniform_float("color", (0.15, 0.95, 0.35, 0.7))
+            batch_ghost.draw(shader)
+    else:
+        batch_marker = batch_for_shader(shader, 'POINTS', {"pos": [marker_vec.to_tuple()]})
+        shader.uniform_float("color", (0.15, 0.95, 0.35, 1.0))
+        batch_marker.draw(shader)
 
     gpu.state.line_width_set(1.0)
     gpu.state.point_size_set(1.0)
@@ -614,7 +673,11 @@ class PHYS_PT_panel(Panel):
 
         props = ob.phys_predict
 
-        layout.prop(props, "show_preview", toggle=True, icon='HIDE_OFF')
+        row = layout.row(align=True)
+        row.prop(props, "show_preview", toggle=True, icon='HIDE_OFF')
+        sub = row.row(align=True)
+        sub.active = props.show_preview
+        sub.prop(props, "ghost", text="", toggle=True, icon='GHOST_ENABLED')
 
         col = layout.column(align=True)
         col.enabled = not props.lock_speed
