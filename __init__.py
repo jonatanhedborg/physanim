@@ -658,8 +658,10 @@ class PHYS_GT_velocity_handle(Gizmo):
         p = self._props(context)
         self._start_velocity = Vector(p.velocity)
         self._start_time = p.prediction_time
-        self._start_handle = self.handle_position(context)
-        self._start_proj = region_2d_to_location_3d(
+        # Integrate per-event mouse deltas into the handle position so holding
+        # Shift can scale movement down without jumping.
+        self._handle = self.handle_position(context)
+        self._last_proj = region_2d_to_location_3d(
             context.region, context.region_data,
             (event.mouse_region_x, event.mouse_region_y), self._origin(context))
         return {'RUNNING_MODAL'}
@@ -695,19 +697,22 @@ class PHYS_GT_velocity_handle(Gizmo):
             return {'RUNNING_MODAL'}
 
         # Move: project the mouse onto the view plane through the origin and
-        # apply the delta to the handle (delta-based, so there's no grab jump).
+        # integrate the per-event delta into the handle (Shift = fine, 0.1x).
         origin = self._origin(context)
         proj = region_2d_to_location_3d(
             context.region, context.region_data,
             (event.mouse_region_x, event.mouse_region_y), origin)
-        if proj is not None and self._start_proj is not None:
-            new_handle = self._start_handle + (proj - self._start_proj)
-            new_vel = (new_handle - origin) / self._scale(context)
+        if proj is not None and self._last_proj is not None:
+            factor = 0.1 if event.shift else 1.0
+            self._handle = self._handle + (proj - self._last_proj) * factor
+            new_vel = (self._handle - origin) / self._scale(context)
             if p.lock_speed:
                 if new_vel.length > 1e-9:
                     p.velocity = new_vel.normalized() * p.locked_speed
             else:
                 p.velocity = new_vel
+        if proj is not None:
+            self._last_proj = proj
 
         self._update_header(context)
         _tag_view3d_redraw(context)
