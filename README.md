@@ -6,6 +6,10 @@ point with the scroll wheel, and bake the result into location keyframes.
 Optional air resistance and ground bouncing make the motion as simple or as
 physical as you need.
 
+![PhysAnim in the Blender viewport: an orange velocity handle and a trajectory
+arc over a ground plane with a green prediction marker, and the PhysAnim sidebar
+panel on the right.](docs/physanim.jpg)
+
 With no air resistance the motion is the exact projectile parabola:
 
 ```
