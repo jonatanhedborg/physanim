@@ -3,8 +3,7 @@
 A Blender animation helper. Give the active object an initial velocity and a
 gravity, preview the trajectory live in the viewport, scrub the prediction
 point with the scroll wheel, and bake the result into location keyframes.
-Optional air resistance and ground bouncing make the motion as simple or as
-physical as you need.
+Optional settings air resistance and ground bouncing.
 
 ![PhysAnim in the Blender viewport: an orange velocity handle and a trajectory
 arc over a ground plane with a green prediction marker, and the PhysAnim sidebar
@@ -20,7 +19,7 @@ Enabling air resistance applies the aerodynamic drag equation
 (`a = -(0.5*rho*Cd*A/m) * |v|*v`), which has no closed form and is solved by
 numerical integration. Bouncing reflects the object off a ground plane.
 
-Tested on **Blender 5.1** (requires 4.2+, ships as an extension).
+Tested on **Blender 5.1** (should work on 4.2+).
 
 ## Install
 
@@ -42,8 +41,8 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
 1. Select an object.
 2. Click **Show Preview**. An orange handle and an orange trajectory arc appear,
    with a green dot at the prediction point. The ghost button next to it swaps
-   that dot for a **ghost outline** of the object at the predicted location.
-3. Set the launch:
+   that dot for an outline of the object at the predicted location.
+3. Set the velocity:
    - **Drag the orange handle** in the viewport to aim; the handle sits at
      `object + velocity`, so dragging it towards a target updates the
      **Initial Velocity** X/Y/Z numbers to match. (Or type the numbers directly.)
@@ -54,13 +53,13 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
      driven from the locked speed, and editing **Launch Speed** rescales the
      velocity while keeping its direction.
    - Adjust **Gravity** if needed (default `0, 0, -9.81`).
-4. Optionally enable physics:
+4. Optional physics:
    - **Air Resistance**: set the **Mass**, pick a **Shape** preset (or a custom
      drag coefficient), give a cross-section (**Area from Bounds** estimates it
      from the object, or enter it), and set **Air Density**. A terminal-speed
      readout shows the combined effect.
    - **Bounce**: set the **Ground Height** and **Bounciness** to bounce the
-     object's origin off a horizontal plane (multiple decaying bounces).
+     object's origin off a horizontal plane.
 5. Choose how far ahead to look:
    - Drag **Prediction Time**, or
    - Click **Scrub Prediction** and roll the **scroll wheel** (Shift = fine,
@@ -100,7 +99,7 @@ not by scrubbing.
   the same way: air resistance is not reproduced, and bouncing needs a collider
   object and uses the scene gravity. A warning is shown if the scene gravity does
   not match the gravity set here, since the rigid body world uses the scene value.
-- The rigid body **pre-roll** sits just before the launch frame, and a rigid body
+- The rigid body setup sits just before the launch frame, and a rigid body
   only simulates when you play from the cache start. If the launch is too close to
   the start of the playback range the pre-roll falls outside it and the velocity
   is lost; the button warns when this happens, so move the launch later or lower
