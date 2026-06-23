@@ -169,23 +169,19 @@ def scene_fps(scene):
     return scene.render.fps / scene.render.fps_base
 
 
-def _has_location_keyframes(ob, frame_lo, frame_hi):
-    """True if the object already has location keyframes within [lo, hi].
+def _action_fcurves(ad):
+    """Yield every F-curve on an animation_data's action.
 
     Tolerant of both legacy actions (Blender < 4.4) and slotted actions (4.4+).
     """
-    ad = ob.animation_data
     if ad is None or ad.action is None:
-        return False
+        return
     action = ad.action
-
-    def in_range(fc):
-        return fc.data_path == "location" and any(
-            frame_lo <= kp.co[0] <= frame_hi for kp in fc.keyframe_points)
 
     legacy = getattr(action, "fcurves", None)
     if legacy is not None:
-        return any(in_range(fc) for fc in legacy)
+        yield from legacy
+        return
 
     slot = getattr(ad, "action_slot", None)
     for layer in action.layers:
@@ -194,8 +190,16 @@ def _has_location_keyframes(ob, frame_lo, frame_hi):
                 bag = strip.channelbag(slot) if slot is not None else None
             except (TypeError, RuntimeError):
                 bag = None
-            if bag is not None and any(in_range(fc) for fc in bag.fcurves):
-                return True
+            if bag is not None:
+                yield from bag.fcurves
+
+
+def _has_location_keyframes(ob, frame_lo, frame_hi):
+    """True if the object already has location keyframes within [lo, hi]."""
+    for fc in _action_fcurves(ob.animation_data):
+        if fc.data_path == "location" and any(
+                frame_lo <= kp.co[0] <= frame_hi for kp in fc.keyframe_points):
+            return True
     return False
 
 
@@ -894,6 +898,155 @@ class PHYS_OT_apply(Operator):
         return {'FINISHED'}
 
 
+class PHYS_OT_to_rigid_body(Operator):
+    bl_idname = "phys.to_rigid_body"
+    bl_label = "Convert to Rigid Body Sim"
+    bl_description = (
+        "Hand the launch position and velocity to Blender's rigid body solver. "
+        "Adds an Active rigid body and keyframes the Animated toggle so the "
+        "object is released at the current frame moving at the initial velocity, "
+        "then Bullet takes over. Air resistance is not reproduced"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None
+
+    def execute(self, context):
+        ob = context.object
+        props = ob.phys_predict
+        scene = context.scene
+        fps = scene_fps(scene)
+
+        if ob.type != 'MESH':
+            self.report({'WARNING'}, "Rigid body simulation needs a mesh object")
+            return {'CANCELLED'}
+
+        F = scene.frame_current
+        p0 = ob.matrix_world.translation.copy()
+        v0 = Vector(props.velocity)
+
+        if ob.parent is not None:
+            self.report(
+                {'WARNING'},
+                "Object is parented: the rigid body simulates in world space and may "
+                "not match the parent's transform.",
+            )
+
+        # Rigid body gravity comes from the scene, scene-wide. Warn if it differs
+        # from our gravity rather than mutating global state behind the user's back.
+        g = Vector(props.gravity)
+        if not scene.use_gravity:
+            self.report(
+                {'WARNING'},
+                "Scene gravity is disabled; the rigid body will not fall. Enable it "
+                "in Scene Properties to match this setup.",
+            )
+        elif (Vector(scene.gravity) - g).length > 1e-3:
+            self.report(
+                {'WARNING'},
+                "Scene gravity {} differs from this setup's gravity {}; the sim uses "
+                "the scene value. Adjust it in Scene Properties to match.".format(
+                    tuple(round(c, 2) for c in scene.gravity),
+                    tuple(round(c, 2) for c in g)),
+            )
+
+        # Ensure a rigid body world exists, then give the object an Active body.
+        if scene.rigidbody_world is None:
+            with context.temp_override(scene=scene):
+                bpy.ops.rigidbody.world_add()
+        if ob.rigid_body is None:
+            with context.temp_override(
+                    object=ob, active_object=ob, selected_objects=[ob]):
+                bpy.ops.rigidbody.object_add()
+
+        rb = ob.rigid_body
+        rb.type = 'ACTIVE'
+        rb.mass = props.mass
+        rb.kinematic = True
+        if props.bounce_enabled:
+            rb.restitution = props.restitution
+
+        # A rigid body only simulates correctly when played from its cache start
+        # frame, and Bullet only carries the kinematic velocity into the dynamic
+        # phase if the body has been kinematic for at least two frames before the
+        # moving step (a single pre-roll frame is silently dropped). So start the
+        # sim a few frames before the launch and hold the object still there.
+        PREROLL = 3
+        pre_start = F - PREROLL
+        cache = scene.rigidbody_world.point_cache
+        moved_start = cache.frame_start < pre_start
+        before_playback = pre_start < scene.frame_start
+        cache.frame_start = pre_start
+        end = F + max(1, round(props.prediction_time * fps))
+        if cache.frame_end < end:
+            cache.frame_end = end
+        if scene.frame_end < end:
+            scene.frame_end = end
+
+        def place(world):
+            if ob.parent is not None:
+                mw = ob.matrix_world.copy()
+                mw.translation = world
+                ob.matrix_world = mw
+            else:
+                ob.location = world - ob.delta_location
+
+        # Animated -> dynamic handoff. Hold the object one frame's worth of v0
+        # behind p0 through the pre-roll, then move it to p0 on the launch frame:
+        # that final kinematic step carries velocity v0, which Bullet keeps when
+        # the Animated flag drops at F+1.
+        back = p0 - v0 / fps
+        for fr in range(pre_start, F):
+            place(back)
+            ob.keyframe_insert(data_path="location", frame=fr)
+            rb.keyframe_insert(data_path="kinematic", frame=fr)
+
+        place(p0)
+        ob.keyframe_insert(data_path="location", frame=F)
+        rb.keyframe_insert(data_path="kinematic", frame=F)
+
+        rb.kinematic = False
+        rb.keyframe_insert(data_path="kinematic", frame=F + 1)
+
+        # Step the Animated keyframes so kinematic flips cleanly instead of
+        # interpolating through fractional values.
+        ad = ob.animation_data
+        if ad is not None and ad.action is not None:
+            for fc in _action_fcurves(ad):
+                if fc.data_path == "rigid_body.kinematic":
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = 'CONSTANT'
+
+        if moved_start:
+            self.report(
+                {'WARNING'},
+                "Rigid body cache now starts at frame {} (the launch pre-roll); any "
+                "earlier simulation will not run.".format(pre_start),
+            )
+
+        if before_playback:
+            self.report(
+                {'WARNING'},
+                "Launch is too close to the playback start: the pre-roll needs "
+                "frames {} to {}, before the range start ({}). Playback skips them "
+                "and the velocity will not be applied. Lower the playback Start frame "
+                "or move the launch later.".format(
+                    pre_start, F - 1, scene.frame_start),
+            )
+
+        # Park the playhead at the cache start so pressing Play runs the pre-roll
+        # that carries the velocity, instead of dropping the object from rest.
+        scene.frame_set(pre_start)
+        self.report(
+            {'INFO'},
+            "Rigid body set up: released at frame {} at {:.2f} m/s. Press Play from "
+            "here (or bake) to run the simulation.".format(F, v0.length),
+        )
+        return {'FINISHED'}
+
+
 # --------------------------------------------------------------------------- #
 # UI panel
 # --------------------------------------------------------------------------- #
@@ -981,6 +1134,10 @@ class PHYS_PT_panel(Panel):
         col.scale_y = 1.3
         col.operator("phys.apply_prediction", icon='KEYTYPE_KEYFRAME_VEC')
 
+        col = layout.column(align=True)
+        col.scale_y = 1.2
+        col.operator("phys.to_rigid_body", icon='RIGID_BODY')
+
 
 # --------------------------------------------------------------------------- #
 # Registration
@@ -990,6 +1147,7 @@ classes = (
     PHYS_PG_props,
     PHYS_OT_scrub,
     PHYS_OT_apply,
+    PHYS_OT_to_rigid_body,
     PHYS_PT_panel,
     PHYS_GT_velocity_handle,
     PHYS_GGT_velocity,

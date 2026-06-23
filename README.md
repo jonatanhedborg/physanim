@@ -65,6 +65,15 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
 6. Click **Apply as Keyframes** to insert location keyframes from the current
    frame through the predicted frame.
 
+Or, instead of baking keyframes, click **Convert to Rigid Body Sim** to hand the
+launch off to Blender's own physics. It adds an Active rigid body to the object
+and keyframes the **Animated** toggle so the object is released at the current
+frame moving at the initial velocity, after which the Bullet solver takes over.
+The button parks the playhead a few frames before the launch (a short pre-roll
+that Bullet needs to pick up the velocity), so just press **Play** from there to
+run it. The motion appears once you play through or bake the rigid body cache,
+not by scrubbing.
+
 ### Notes & options
 
 - **Handle Distance** changes only how far away the drag handle sits per m/s
@@ -81,3 +90,14 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
   the result may not match the parent's transform.
 - **Bounce** reflects the object's **origin** off the ground plane, so set the
   height to suit the object's pivot/size.
+- **Convert to Rigid Body Sim** transfers only the initial conditions (position,
+  velocity, mass). From there Blender's solver runs the motion, so the result
+  diverges from the preview where the preview used effects Bullet does not model
+  the same way: air resistance is not reproduced, and bouncing needs a collider
+  object and uses the scene gravity. A warning is shown if the scene gravity does
+  not match the gravity set here, since the rigid body world uses the scene value.
+- The rigid body **pre-roll** sits just before the launch frame, and a rigid body
+  only simulates when you play from the cache start. If the launch is too close to
+  the start of the playback range the pre-roll falls outside it and the velocity
+  is lost; the button warns when this happens, so move the launch later or lower
+  the playback **Start** frame.

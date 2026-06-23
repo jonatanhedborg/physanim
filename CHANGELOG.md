@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.0] - 2026-06-23
+
+### Added
+- Convert to Rigid Body Sim: a button that hands the launch position and velocity
+  to Blender's rigid body solver. It adds an Active rigid body and keyframes the
+  Animated toggle so the object is released at the current frame moving at the
+  initial velocity, then Bullet takes over. The playhead is parked on a short
+  pre-roll before the launch so pressing Play runs the handoff. Air resistance is
+  not reproduced and gravity comes from the scene; warnings are shown if the scene
+  gravity differs or the launch is too close to the playback start.
+
 ## [1.2.0] - 2026-06-22
 
 ### Added
