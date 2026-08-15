@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.0] - 2026-08-15
+
+### Added
+- Align to Motion: a toggle that rotates the object to face its direction of
+  travel, with a pick of which local axis is forward (+/- X, Y or Z) and which
+  axis is kept up. The ghost preview shows the orientation at the prediction
+  point, and baking writes rotation keyframes alongside the location ones (on
+  the channel matching the object's rotation mode). The direction is read off
+  the baked path, so it follows drag and flips after a bounce. Convert to Rigid
+  Body Sim uses it for the launch orientation only.
+
 ## [1.3.0] - 2026-06-23
 
 ### Added

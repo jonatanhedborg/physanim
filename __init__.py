@@ -30,7 +30,7 @@ from bpy_extras.view3d_utils import (
     location_3d_to_region_2d,
     region_2d_to_location_3d,
 )
-from mathutils import Vector, Matrix
+from mathutils import Vector, Matrix, Quaternion
 
 
 # --------------------------------------------------------------------------- #
@@ -194,13 +194,117 @@ def _action_fcurves(ad):
                 yield from bag.fcurves
 
 
-def _has_location_keyframes(ob, frame_lo, frame_hi):
-    """True if the object already has location keyframes within [lo, hi]."""
+def _has_keyframes(ob, frame_lo, frame_hi, data_paths=("location",)):
+    """True if the object already has keys on ``data_paths`` within [lo, hi]."""
     for fc in _action_fcurves(ob.animation_data):
-        if fc.data_path == "location" and any(
+        if fc.data_path in data_paths and any(
                 frame_lo <= kp.co[0] <= frame_hi for kp in fc.keyframe_points):
             return True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Motion alignment (rotate the object to face the direction of travel)
+# --------------------------------------------------------------------------- #
+
+# Track axis identifiers accepted by Vector.to_track_quat.
+_FORWARD_AXIS_ITEMS = [
+    ('X', "+X", "Local +X points along the direction of travel"),
+    ('Y', "+Y", "Local +Y points along the direction of travel"),
+    ('Z', "+Z", "Local +Z points along the direction of travel"),
+    ('-X', "-X", "Local -X points along the direction of travel"),
+    ('-Y', "-Y", "Local -Y points along the direction of travel"),
+    ('-Z', "-Z", "Local -Z points along the direction of travel"),
+]
+
+_UP_AXIS_ITEMS = [
+    ('X', "X", "Local X is kept as the up axis"),
+    ('Y', "Y", "Local Y is kept as the up axis"),
+    ('Z', "Z", "Local Z is kept as the up axis"),
+]
+
+_NEXT_AXIS = {'X': 'Y', 'Y': 'Z', 'Z': 'X'}
+
+
+def alignment_quat(props, direction):
+    """World rotation putting the forward axis along ``direction``, or None.
+
+    ``None`` means "leave the rotation alone" (the direction is degenerate,
+    which happens when the object is momentarily at rest at the apex of a
+    perfectly vertical throw).
+    """
+    if direction.length < 1e-9:
+        return None
+    up = props.up_axis
+    # to_track_quat requires the two axes to be distinct.
+    if up == props.forward_axis.lstrip('-'):
+        up = _NEXT_AXIS[up]
+    return direction.to_track_quat(props.forward_axis, up)
+
+
+def velocity_at(sampler, t, h=1e-3):
+    """Direction of travel at time ``t``, by central difference on the path.
+
+    Works for every motion model (closed form, drag, bounce) without needing a
+    separate velocity solution, and matches the drawn path by construction.
+    """
+    lo = max(0.0, t - h)
+    hi = t + h
+    return (sampler(hi) - sampler(lo)) / max(hi - lo, 1e-9)
+
+
+def _rotation_data_path(ob):
+    if ob.rotation_mode == 'QUATERNION':
+        return "rotation_quaternion"
+    if ob.rotation_mode == 'AXIS_ANGLE':
+        return "rotation_axis_angle"
+    return "rotation_euler"
+
+
+def _delta_quat(ob):
+    """The object's delta rotation as a quaternion, for the current mode.
+
+    Blender composes the final rotation as ``delta @ rotation``, so a world
+    target has to be divided by this before it goes into the rotation channels.
+    Axis-angle mode has a delta that RNA does not expose; it is treated as
+    identity there.
+    """
+    if ob.rotation_mode == 'QUATERNION':
+        return ob.delta_rotation_quaternion.copy()
+    if ob.rotation_mode == 'AXIS_ANGLE':
+        return Quaternion()
+    return ob.delta_rotation_euler.to_quaternion()
+
+
+def apply_world_rotation(ob, quat):
+    """Write ``quat`` (world space) into the object's rotation channels.
+
+    Keeps continuity with the current rotation so a baked sequence doesn't flip
+    between frames: euler uses a compatible conversion, quaternion picks the
+    nearer of the two equivalent signs.
+    """
+    local = _delta_quat(ob).inverted() @ quat
+    mode = ob.rotation_mode
+    if mode == 'QUATERNION':
+        if local.dot(ob.rotation_quaternion) < 0.0:
+            local.negate()
+        ob.rotation_quaternion = local
+    elif mode == 'AXIS_ANGLE':
+        axis, angle = local.to_axis_angle()
+        ob.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+    else:
+        ob.rotation_euler = local.to_euler(mode, ob.rotation_euler)
+
+
+def aligned_matrix(ob, props, position, direction):
+    """``ob.matrix_world`` moved to ``position``, aligned to ``direction``."""
+    quat = alignment_quat(props, direction) if props.align_to_motion else None
+    if quat is None:
+        mat = ob.matrix_world.copy()
+        mat.translation = position
+        return mat
+    _, _, scale = ob.matrix_world.decompose()
+    return Matrix.LocRotScale(position, quat, scale)
 
 
 # --------------------------------------------------------------------------- #
@@ -399,6 +503,28 @@ class PHYS_PG_props(PropertyGroup):
         precision=3,
         update=_redraw_update,
     )
+    align_to_motion: BoolProperty(
+        name="Align to Motion",
+        description="Rotate the object so its forward axis follows the direction of "
+                    "travel. Affects the ghost preview and the baked keyframes",
+        default=False,
+        update=_redraw_update,
+    )
+    forward_axis: EnumProperty(
+        name="Forward",
+        description="Local axis of the object that points along the direction of travel",
+        items=_FORWARD_AXIS_ITEMS,
+        default='Y',
+        update=_redraw_update,
+    )
+    up_axis: EnumProperty(
+        name="Up",
+        description="Local axis kept pointing up, which fixes the roll around the "
+                    "forward axis",
+        items=_UP_AXIS_ITEMS,
+        default='Z',
+        update=_redraw_update,
+    )
     prediction_time: FloatProperty(
         name="Prediction Time",
         description="How far into the future to predict, in seconds",
@@ -524,8 +650,7 @@ def _draw_geometry():
         (start, (0.95, 0.95, 0.95, 1.0), 0.0),
     ]
     if props.ghost:
-        ghost_mat = ob.matrix_world.copy()
-        ghost_mat.translation = marker_vec
+        ghost_mat = aligned_matrix(ob, props, marker_vec, velocity_at(sampler, t_end))
         segs = _ghost_segments(ob, ghost_mat, context)
         if segs:
             ghost = batch_for_shader(shader, 'LINES', {"pos": segs})
@@ -867,33 +992,49 @@ class PHYS_OT_apply(Operator):
         if not frames or frames[-1] != end_frame:
             frames.append(end_frame)
 
-        if _has_location_keyframes(ob, start_frame, end_frame):
+        rot_path = _rotation_data_path(ob)
+        paths = ("location", rot_path) if props.align_to_motion else ("location",)
+        if _has_keyframes(ob, start_frame, end_frame, paths):
             self.report(
                 {'WARNING'},
-                "Object already has location keyframes between frames {}-{}; "
-                "the baked path is mixed with them.".format(start_frame, end_frame),
+                "Object already has location/rotation keyframes between frames "
+                "{}-{}; the baked path is mixed with them.".format(
+                    start_frame, end_frame),
             )
 
         _, sampler = build_trajectory(p0, v0, props, t_end, _drag_k(props, ob))
         for fr in frames:
             t = (fr - start_frame) / fps
             world = sampler(t)
+            quat = None
+            if props.align_to_motion:
+                quat = alignment_quat(props, velocity_at(sampler, t))
             if ob.parent is not None:
                 mw = ob.matrix_world.copy()
-                mw.translation = world
+                if quat is not None:
+                    _, _, scale = mw.decompose()
+                    mw = Matrix.LocRotScale(world, quat, scale)
+                else:
+                    mw.translation = world
                 ob.matrix_world = mw
             else:
                 # location excludes delta_location, but the world-space target
                 # (and p0) include it, so compensate to land at the right spot.
                 ob.location = world - ob.delta_location
+                if quat is not None:
+                    apply_world_rotation(ob, quat)
             ob.keyframe_insert(data_path="location", frame=fr)
+            if props.align_to_motion:
+                ob.keyframe_insert(data_path=rot_path, frame=fr)
 
         # Snap evaluation back to the start so the object sits at p0 again.
         scene.frame_set(start_frame)
         self.report(
             {'INFO'},
-            "Inserted {} location keyframes (frames {}-{}).".format(
-                len(frames), start_frame, end_frame),
+            "Inserted {} {} keyframes (frames {}-{}).".format(
+                len(frames),
+                "location + rotation" if props.align_to_motion else "location",
+                start_frame, end_frame),
         )
         return {'FINISHED'}
 
@@ -905,7 +1046,8 @@ class PHYS_OT_to_rigid_body(Operator):
         "Hand the launch position and velocity to Blender's rigid body solver. "
         "Adds an Active rigid body and keyframes the Animated toggle so the "
         "object is released at the current frame moving at the initial velocity, "
-        "then Bullet takes over. Air resistance is not reproduced"
+        "then Bullet takes over. Air resistance is not reproduced, and Align to "
+        "Motion only sets the launch orientation"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -985,13 +1127,31 @@ class PHYS_OT_to_rigid_body(Operator):
         if scene.frame_end < end:
             scene.frame_end = end
 
+        # Alignment only sets the launch orientation: once the body is dynamic,
+        # Bullet owns the rotation. Keeping the orientation constant through the
+        # pre-roll hands it over with zero angular velocity.
+        launch_quat = alignment_quat(props, v0) if props.align_to_motion else None
+        rot_path = _rotation_data_path(ob)
+
         def place(world):
             if ob.parent is not None:
                 mw = ob.matrix_world.copy()
-                mw.translation = world
+                if launch_quat is not None:
+                    _, _, scale = mw.decompose()
+                    mw = Matrix.LocRotScale(world, launch_quat, scale)
+                else:
+                    mw.translation = world
                 ob.matrix_world = mw
             else:
                 ob.location = world - ob.delta_location
+                if launch_quat is not None:
+                    apply_world_rotation(ob, launch_quat)
+
+        def key(fr):
+            ob.keyframe_insert(data_path="location", frame=fr)
+            if launch_quat is not None:
+                ob.keyframe_insert(data_path=rot_path, frame=fr)
+            rb.keyframe_insert(data_path="kinematic", frame=fr)
 
         # Animated -> dynamic handoff. Hold the object one frame's worth of v0
         # behind p0 through the pre-roll, then move it to p0 on the launch frame:
@@ -1000,12 +1160,10 @@ class PHYS_OT_to_rigid_body(Operator):
         back = p0 - v0 / fps
         for fr in range(pre_start, F):
             place(back)
-            ob.keyframe_insert(data_path="location", frame=fr)
-            rb.keyframe_insert(data_path="kinematic", frame=fr)
+            key(fr)
 
         place(p0)
-        ob.keyframe_insert(data_path="location", frame=F)
-        rb.keyframe_insert(data_path="kinematic", frame=F)
+        key(F)
 
         rb.kinematic = False
         rb.keyframe_insert(data_path="kinematic", frame=F + 1)
@@ -1112,6 +1270,16 @@ class PHYS_PT_panel(Panel):
         if props.bounce_enabled:
             box.prop(props, "ground_height")
             box.prop(props, "restitution", slider=True)
+
+        box = layout.box()
+        box.prop(props, "align_to_motion")
+        if props.align_to_motion:
+            col = box.column(align=True)
+            col.prop(props, "forward_axis")
+            col.prop(props, "up_axis")
+            if props.up_axis == props.forward_axis.lstrip('-'):
+                box.label(text="Up matches Forward; using {}".format(
+                    _NEXT_AXIS[props.up_axis]), icon='INFO')
 
         layout.prop(props, "prediction_time")
 

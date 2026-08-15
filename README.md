@@ -3,7 +3,8 @@
 A Blender animation helper. Give the active object an initial velocity and a
 gravity, preview the trajectory live in the viewport, scrub the prediction
 point with the scroll wheel, and bake the result into location keyframes.
-Optional settings air resistance and ground bouncing.
+Optional settings air resistance, ground bouncing and aligning the object to its
+direction of travel.
 
 ![PhysAnim in the Blender viewport: an orange velocity handle and a trajectory
 arc over a ground plane with a green prediction marker, and the PhysAnim sidebar
@@ -60,13 +61,20 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
      readout shows the combined effect.
    - **Bounce**: set the **Ground Height** and **Bounciness** to bounce the
      object's origin off a horizontal plane.
+   - **Align to Motion**: rotate the object so it faces the way it is moving.
+     Pick which local axis is **Forward** (+/- X, Y or Z; the default is +Y,
+     Blender's usual "front" for an object modelled facing away from you) and
+     which axis is kept **Up**, which fixes the roll around the forward axis.
+     With the ghost preview on you can see the orientation at the prediction
+     point before baking.
 5. Choose how far ahead to look:
    - Drag **Prediction Time**, or
    - Click **Scrub Prediction** and roll the **scroll wheel** (Shift = fine,
      Ctrl = coarse). Enter/click confirms, Esc cancels.
    The predicted frame is shown in the panel and next to the green marker.
 6. Click **Apply as Keyframes** to insert location keyframes from the current
-   frame through the predicted frame.
+   frame through the predicted frame (plus rotation keyframes if **Align to
+   Motion** is on).
 
 Or, instead of baking keyframes, click **Convert to Rigid Body Sim** to hand the
 launch off to Blender's own physics. It adds an Active rigid body to the object
@@ -93,11 +101,18 @@ not by scrubbing.
   the result may not match the parent's transform.
 - **Bounce** reflects the object's **origin** off the ground plane, so set the
   height to suit the object's pivot/size.
+- **Align to Motion** replaces the object's rotation rather than adding to it,
+  and writes keys on whichever rotation channel matches the object's rotation
+  mode (euler, quaternion or axis-angle). The direction is read off the baked
+  path, so it follows drag and flips after a bounce. At the apex of a straight-up
+  throw the direction is undefined for an instant, and the rotation there is
+  left as it is.
 - **Convert to Rigid Body Sim** transfers only the initial conditions (position,
   velocity, mass). From there Blender's solver runs the motion, so the result
   diverges from the preview where the preview used effects Bullet does not model
-  the same way: air resistance is not reproduced, and bouncing needs a collider
-  object and uses the scene gravity. A warning is shown if the scene gravity does
+  the same way: air resistance is not reproduced, bouncing needs a collider
+  object and uses the scene gravity, and **Align to Motion** only sets the
+  orientation at the launch frame, since Bullet owns the rotation from there on. A warning is shown if the scene gravity does
   not match the gravity set here, since the rigid body world uses the scene value.
 - The rigid body setup sits just before the launch frame, and a rigid body
   only simulates when you play from the cache start. If the launch is too close to
