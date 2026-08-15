@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.0] - 2026-08-15
+
+### Added
+- Pin: a pin button next to Show Preview that keeps the panel, the trajectory
+  overlay, the drag handle and the operators on one object while the selection
+  changes, so an aim target can be moved without losing the setup being edited.
+  The pin is stored on the scene, saved with the file, and clears itself when
+  the pinned object is deleted.
+- Aim At: point the launch at another object, typically an empty snapped to a
+  launch tube. The velocity is then derived from that object and follows it
+  live, so aiming uses Blender's normal snapping instead of the drag handle
+  (which hides itself while a target is set). Distance sets the speed as usual,
+  unless the speed is locked, in which case the target gives direction only.
+- Thrust: a list of burns applied over a window of time after the launch, each
+  with a start and duration in seconds, a direction (along the current velocity,
+  like a rocket motor, or a fixed world vector), and a strength entered either
+  as a delta-v (total speed added over the burn) or as an acceleration held for
+  its length. Burns can be staged and may overlap, so a booster charge followed
+  by a motor is two entries. The arc marks where each burn lights and cuts out,
+  and Convert to Rigid Body Sim warns that burns are not transferred.
+
+### Changed
+- With Lock Speed on, the velocity handle can be dragged to any distance
+  instead of snapping back to the distance implied by the locked speed. Only
+  its direction is read, and the distance is remembered separately, so the
+  handle can be parked wherever it reads best in the viewport.
+
 ## [1.4.0] - 2026-08-15
 
 ### Added

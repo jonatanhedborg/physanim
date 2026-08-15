@@ -3,8 +3,8 @@
 A Blender animation helper. Give the active object an initial velocity and a
 gravity, preview the trajectory live in the viewport, scrub the prediction
 point with the scroll wheel, and bake the result into location keyframes.
-Optional settings air resistance, ground bouncing and aligning the object to its
-direction of travel.
+Optional settings air resistance, ground bouncing, thrust burns and aligning the
+object to its direction of travel.
 
 ![PhysAnim in the Blender viewport: an orange velocity handle and a trajectory
 arc over a ground plane with a green prediction marker, and the PhysAnim sidebar
@@ -42,7 +42,10 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
 1. Select an object.
 2. Click **Show Preview**. An orange handle and an orange trajectory arc appear,
    with a green dot at the prediction point. The ghost button next to it swaps
-   that dot for an outline of the object at the predicted location.
+   that dot for an outline of the object at the predicted location. The pin
+   button at the end of the row keeps the panel and preview on this object
+   while you select and move other things, which is what you want when the
+   launch is aimed at an empty.
 3. Set the velocity:
    - **Drag the orange handle** in the viewport to aim; the handle sits at
      `object + velocity`, so dragging it towards a target updates the
@@ -52,7 +55,14 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
    - The panel shows the **launch speed**. Toggle the lock to fix the
      speed: the handle then only sets *direction*, the velocity inputs are
      driven from the locked speed, and editing **Launch Speed** rescales the
-     velocity while keeping its direction.
+     velocity while keeping its direction. With the speed locked the handle can
+     also be dragged to any distance you like, since only its direction is
+     read, so park it wherever it is easiest to see.
+   - Or set **Aim At** to another object, typically an empty snapped to a launch
+     tube or a barrel. The velocity then points from the object at that target
+     and follows it live, so aiming becomes a matter of moving the empty with
+     Blender's normal snapping. The drag handle steps aside while a target is
+     set, and a faint line shows what is being aimed at.
    - Adjust **Gravity** if needed (default `0, 0, -9.81`).
 4. Optional physics:
    - **Air Resistance**: set the **Mass**, pick a **Shape** preset (or a custom
@@ -61,6 +71,13 @@ The panel lives in the 3D Viewport sidebar (press **N**) under the
      readout shows the combined effect.
    - **Bounce**: set the **Ground Height** and **Bounciness** to bounce the
      object's origin off a horizontal plane.
+   - **Thrust**: click **+** to add a burn, a push applied over a window of
+     time after the launch. Set when it starts and how long it lasts (in
+     seconds after the launch, with the frame range shown below), whether it
+     pushes **Along Velocity** (like a rocket motor) or along a fixed **World
+     Vector**, and how strong it is. Add more burns to stage them, for example
+     a short booster charge followed by a longer motor. Blue dots on the arc
+     mark where each burn lights and cuts out.
    - **Align to Motion**: rotate the object so it faces the way it is moving.
      Pick which local axis is **Forward** (+/- X, Y or Z; the default is +Y,
      Blender's usual "front" for an object modelled facing away from you) and
@@ -87,8 +104,20 @@ not by scrubbing.
 
 ### Notes & options
 
-- **Handle Distance** changes only how far away the drag handle sits per m/s
-  (visual convenience); it does not affect the simulation.
+- **Handle Distance** changes only how far away the drag handle sits (visual
+  convenience); it does not affect the simulation. Unlocked it is metres per
+  1 m/s of velocity, since the handle's distance is what sets the speed. With
+  the speed locked it is a plain distance in metres, free of the speed.
+- The **pin** applies to everything the add-on does, not just the panel: the
+  trajectory overlay, the drag handle, and the Apply/Convert buttons all keep
+  working on the pinned object while another one is selected. The panel says
+  which object is pinned. The pin is saved with the file and clears itself if
+  the pinned object is deleted.
+- **Aim At** derives the velocity rather than storing it, so the direction
+  tracks the target and the launcher as either moves, with no need to re-aim.
+  Distance still sets the speed unless the speed is locked, in which case the
+  target gives direction only. Clearing the target returns to the **Initial
+  Velocity** values, which are the last ones set by hand.
 - **Path Steps** controls how smooth the drawn arc looks (plain-gravity only;
   with drag or bounce the path is drawn from the integration steps).
 - **Keyframe Every** = `1` keys every frame and is recommended. Larger values
@@ -101,6 +130,23 @@ not by scrubbing.
   the result may not match the parent's transform.
 - **Bounce** reflects the object's **origin** off the ground plane, so set the
   height to suit the object's pivot/size.
+- A burn's strength is entered either as **Delta-V**, the total speed it adds
+  over the burn, or as an **Acceleration** held for the burn's length. The two
+  are the same number divided by the duration, and the panel always shows the
+  other one below the field. The choice decides what happens when you retime
+  the burn: in Delta-V mode the speed change stays put and the acceleration
+  moves, in Acceleration mode the push stays put and the speed change moves.
+- The delta-v of a burn is the **thrust contribution only**. Gravity and drag
+  take their share over the same window, so a 30 m/s burn lasting 3 seconds
+  straight up leaves the object roughly 0.6 m/s faster, not 30. The total shown
+  under the burn list is thrust delta-v, not a final speed.
+- Burns push **Along Velocity** by default, which is what makes a rocket
+  accelerate along its flight path without curving it. From a standstill there
+  is no velocity to follow, so the thrust starts along the launch direction, or
+  straight up if the launch velocity is zero too.
+- Any burn switches the trajectory to the numerical integrator, the same as air
+  resistance and bounce do, so the exact parabola is used only for plain
+  unpowered throws.
 - **Align to Motion** replaces the object's rotation rather than adding to it,
   and writes keys on whichever rotation channel matches the object's rotation
   mode (euler, quaternion or axis-angle). The direction is read off the baked
@@ -111,7 +157,8 @@ not by scrubbing.
   velocity, mass). From there Blender's solver runs the motion, so the result
   diverges from the preview where the preview used effects Bullet does not model
   the same way: air resistance is not reproduced, bouncing needs a collider
-  object and uses the scene gravity, and **Align to Motion** only sets the
+  object and uses the scene gravity, thrust burns are not transferred at all
+  (the body gets the launch velocity only), and **Align to Motion** only sets the
   orientation at the launch frame, since Bullet owns the rotation from there on. A warning is shown if the scene gravity does
   not match the gravity set here, since the rigid body world uses the scene value.
 - The rigid body setup sits just before the launch frame, and a rigid body

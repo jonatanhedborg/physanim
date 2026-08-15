@@ -24,6 +24,7 @@ from bpy.props import (
     BoolProperty,
     EnumProperty,
     PointerProperty,
+    CollectionProperty,
 )
 from gpu_extras.batch import batch_for_shader
 from bpy_extras.view3d_utils import (
@@ -56,6 +57,11 @@ def sample_trajectory(p0, v0, g, t_end, segments):
 # no closed form (drag, and later bounce). 240 Hz is plenty for preview/bake.
 SIM_DT = 1.0 / 240.0
 SIM_MAX_STEPS = 20000
+
+# Shortest burn we allow. Thrust is stored as an acceleration, so a zero-length
+# burn would need an infinite one; a true instantaneous impulse would be a
+# separate branch in the integrator.
+MIN_BURN_DURATION = 1e-3
 
 
 # Drag coefficients (Cd) for common shapes, used by the shape preset.
@@ -93,8 +99,51 @@ def _drag_k(props, ob):
     return 0.5 * props.air_density * props.drag_cd * area / mass
 
 
-def _integrate(p0, v0, a_const, drag_k, t_end, bounce=None):
+def burn_plan(props, v0):
+    """Flatten the enabled burns into plain tuples for the integrator.
+
+    Returns ``(start, end, world_vec, magnitude)`` sorted by start time, where
+    ``world_vec`` is None for thrust that follows the velocity. Reading RNA once
+    here keeps the property system out of the 240 Hz integration loop.
+    Overlapping burns are legal and simply sum.
+    """
+    plan = []
+    for b in getattr(props, "burns", ()):
+        if not b.enabled or b.magnitude == 0.0:
+            continue
+        end = b.start + max(b.duration, MIN_BURN_DURATION)
+        if b.direction_mode == 'WORLD':
+            d = Vector(b.direction)
+            if d.length < 1e-9:
+                continue
+            plan.append((b.start, end, d.normalized() * b.magnitude, 0.0))
+        else:
+            plan.append((b.start, end, None, b.magnitude))
+    plan.sort(key=lambda e: e[0])
+    return plan
+
+
+def _burn_accel(plan, t, v, seed_dir):
+    """Total thrust acceleration at time ``t`` for a body moving at ``v``."""
+    a = Vector((0.0, 0.0, 0.0))
+    for start, end, world_vec, magnitude in plan:
+        if start <= t < end:
+            if world_vec is not None:
+                a += world_vec
+            elif v.length > 1e-9:
+                a += v.normalized() * magnitude
+            else:
+                # Thrusting from a standstill has no velocity to follow, so fall
+                # back to the launch direction.
+                a += seed_dir * magnitude
+    return a
+
+
+def _integrate(p0, v0, a_const, drag_k, t_end, bounce=None, plan=None, seed_dir=None):
     """Semi-implicit (symplectic) Euler integration with quadratic drag.
+
+    ``plan`` is the thrust schedule from ``burn_plan`` (or None), added to the
+    constant acceleration while each burn is active.
 
     ``bounce`` is ``None`` or ``(ground_z, restitution)``: when the point crosses
     below the ground plane while moving down, it is clamped to the plane and its
@@ -111,9 +160,14 @@ def _integrate(p0, v0, a_const, drag_k, t_end, bounce=None):
     p = p0.copy()
     v = v0.copy()
     pts = [p.copy()]
+    t = 0.0
     for _ in range(n):
-        v = v + (a_const - (drag_k * v.length) * v) * dt
+        a = a_const
+        if plan:
+            a = a + _burn_accel(plan, t, v, seed_dir)
+        v = v + (a - (drag_k * v.length) * v) * dt
         p = p + v * dt
+        t += dt
         if bounce is not None:
             ground_z, restitution = bounce
             if p.z < ground_z and v.z < 0.0:
@@ -138,14 +192,15 @@ def build_trajectory(p0, v0, props, t_end, drag_k=0.0):
     """Return ``(draw_points, sampler)`` for the trajectory over ``[0, t_end]``.
 
     ``draw_points`` is a list of ``Vector`` for the viewport polyline; ``sampler``
-    is ``f(t) -> Vector`` giving the position at time ``t``. With no drag the
-    motion uses the exact closed form; air resistance uses the integrator.
+    is ``f(t) -> Vector`` giving the position at time ``t``. Plain gravity uses
+    the exact closed form; air resistance, bounce and thrust use the integrator.
     """
     t_end = max(t_end, 1e-6)
     a_const = Vector(props.gravity)
     bounce = (props.ground_height, props.restitution) if props.bounce_enabled else None
+    plan = burn_plan(props, v0)
 
-    if drag_k <= 0.0 and bounce is None:
+    if drag_k <= 0.0 and bounce is None and not plan:
         def sampler(t, _p0=p0, _v0=v0, _a=a_const):
             return trajectory_point(_p0, _v0, _a, t)
 
@@ -153,7 +208,8 @@ def build_trajectory(p0, v0, props, t_end, drag_k=0.0):
         draw = [sampler(t_end * i / n) for i in range(n + 1)]
         return draw, sampler
 
-    pts, dt = _integrate(p0, v0, a_const, drag_k, t_end, bounce)
+    seed_dir = v0.normalized() if v0.length > 1e-9 else Vector((0.0, 0.0, 1.0))
+    pts, dt = _integrate(p0, v0, a_const, drag_k, t_end, bounce, plan, seed_dir)
 
     def sampler(t, _pts=pts, _dt=dt):
         return _sample_path(_pts, _dt, t)
@@ -163,6 +219,31 @@ def build_trajectory(p0, v0, props, t_end, drag_k=0.0):
     if draw[-1] is not pts[-1]:
         draw.append(pts[-1])
     return draw, sampler
+
+
+def aim_target(ob, props):
+    """The object the launch is aimed at, or None if aiming is manual."""
+    target = props.target
+    if target is None or target == ob:
+        return None
+    return target
+
+
+def launch_velocity(ob, props):
+    """Initial velocity in world space, resolving an aim target if one is set.
+
+    With a target the velocity is derived rather than stored, so moving the
+    target (or the launcher) re-aims the shot live. Locking the speed keeps only
+    the direction from the target, exactly as it does for the drag handle.
+    """
+    target = aim_target(ob, props)
+    if target is not None:
+        aim = target.matrix_world.translation - ob.matrix_world.translation
+        if aim.length > 1e-9:
+            if props.lock_speed:
+                return aim.normalized() * props.locked_speed
+            return aim / max(props.display_scale, 1e-4)
+    return Vector(props.velocity)
 
 
 def scene_fps(scene):
@@ -333,6 +414,9 @@ def _update_lock(self, context):
     # velocity doesn't jump. Setting locked_speed re-normalises via its own update.
     if self.lock_speed:
         v = Vector(self.velocity)
+        # The handle is placed by handle_reach once locked, so seed it with
+        # where the handle already is and it stays put through the toggle.
+        self.handle_reach = max(v.length * self.display_scale, 0.01)
         if v.length > 1e-9:
             self.locked_speed = v.length
         else:
@@ -359,11 +443,137 @@ def _update_cd_preset(self, context):
     _tag_view3d_redraw(context)
 
 
+# Guard against the burn sync callbacks re-entering each other: assigning a
+# property from Python fires its update callback, which would assign back.
+_syncing_burn = False
+
+
+def _burn_sync(self, keep_delta_v):
+    """Restore ``delta_v == magnitude * duration`` by recomputing the other side."""
+    global _syncing_burn
+    if _syncing_burn:
+        return
+    _syncing_burn = True
+    try:
+        duration = max(self.duration, MIN_BURN_DURATION)
+        if keep_delta_v:
+            self.magnitude = self.delta_v / duration
+        else:
+            self.delta_v = self.magnitude * duration
+    finally:
+        _syncing_burn = False
+
+
+def _update_burn_delta_v(self, context):
+    _burn_sync(self, keep_delta_v=True)
+    _tag_view3d_redraw(context)
+
+
+def _update_burn_magnitude(self, context):
+    _burn_sync(self, keep_delta_v=False)
+    _tag_view3d_redraw(context)
+
+
+def _update_burn_duration(self, context):
+    # Retiming a burn keeps whichever quantity the user is authoring: in delta-v
+    # mode the speed change is what stays fixed, in acceleration mode the push.
+    _burn_sync(self, keep_delta_v=self.input_mode == 'DELTA_V')
+    _tag_view3d_redraw(context)
+
+
 # --------------------------------------------------------------------------- #
 # Properties (stored per object)
 # --------------------------------------------------------------------------- #
 
+class PHYS_PG_burn(PropertyGroup):
+    """One thrust burn: a push applied over a time window after the launch.
+
+    ``magnitude`` (the acceleration) is what the integrator reads; ``delta_v``
+    is the same quantity expressed as the total speed change over the burn, and
+    the two are kept consistent so nothing downstream has to special-case the
+    authoring mode.
+    """
+    enabled: BoolProperty(
+        name="Enabled",
+        description="Include this burn in the trajectory",
+        default=True,
+        update=_redraw_update,
+    )
+    start: FloatProperty(
+        name="Start",
+        description="Seconds after the launch when the thrust starts",
+        default=0.0,
+        min=0.0,
+        soft_max=10.0,
+        step=10,
+        precision=3,
+        update=_redraw_update,
+    )
+    duration: FloatProperty(
+        name="Duration",
+        description="How long the thrust lasts, in seconds",
+        default=1.0,
+        min=MIN_BURN_DURATION,
+        soft_max=10.0,
+        step=10,
+        precision=3,
+        update=_update_burn_duration,
+    )
+    direction_mode: EnumProperty(
+        name="Direction",
+        description="Which way the thrust pushes",
+        items=[
+            ('FORWARD', "Along Velocity",
+             "Push along the current direction of travel, like a rocket motor"),
+            ('WORLD', "World Vector",
+             "Push along a fixed direction in world space"),
+        ],
+        default='FORWARD',
+        update=_redraw_update,
+    )
+    direction: FloatVectorProperty(
+        name="Direction",
+        description="World-space direction of the thrust (its length is ignored)",
+        size=3,
+        subtype='XYZ',
+        default=(0.0, 0.0, 1.0),
+        update=_redraw_update,
+    )
+    input_mode: EnumProperty(
+        name="Thrust As",
+        description="How the strength of the burn is entered",
+        items=[
+            ('DELTA_V', "Delta-V",
+             "Total speed change the thrust adds over the burn (m/s)"),
+            ('ACCEL', "Acceleration",
+             "Acceleration sustained for the length of the burn (m/s^2)"),
+        ],
+        default='DELTA_V',
+        update=_redraw_update,
+    )
+    delta_v: FloatProperty(
+        name="Delta-V",
+        description="Speed the thrust adds over the whole burn, before gravity "
+                    "and drag take their share",
+        default=10.0,
+        step=10,
+        precision=3,
+        unit='VELOCITY',
+        update=_update_burn_delta_v,
+    )
+    magnitude: FloatProperty(
+        name="Acceleration",
+        description="Thrust acceleration held for the length of the burn",
+        default=10.0,
+        step=10,
+        precision=3,
+        unit='ACCELERATION',
+        update=_update_burn_magnitude,
+    )
+
+
 class PHYS_PG_props(PropertyGroup):
+    burns: CollectionProperty(type=PHYS_PG_burn)
     show_preview: BoolProperty(
         name="Show Preview",
         description="Draw the predicted trajectory and the velocity handle in the viewport",
@@ -384,6 +594,14 @@ class PHYS_PG_props(PropertyGroup):
         subtype='VELOCITY',
         unit='VELOCITY',
         default=(0.0, 0.0, 8.0),
+        update=_redraw_update,
+    )
+    target: PointerProperty(
+        name="Aim At",
+        description="Aim the launch at another object (an empty parented to a "
+                    "launch tube, say). The velocity then follows that object "
+                    "instead of the drag handle",
+        type=bpy.types.Object,
         update=_redraw_update,
     )
     lock_speed: BoolProperty(
@@ -553,6 +771,17 @@ class PHYS_PG_props(PropertyGroup):
         soft_max=5.0,
         update=_redraw_update,
     )
+    handle_reach: FloatProperty(
+        name="Handle Distance",
+        description="How far the drag handle sits from the object while the speed "
+                    "is locked. Purely visual: with the speed locked the handle "
+                    "sets direction only, so it can sit at any distance",
+        default=10.0,
+        min=0.01,
+        soft_max=100.0,
+        unit='LENGTH',
+        update=_redraw_update,
+    )
     keyframe_step: IntProperty(
         name="Keyframe Every",
         description="Insert a keyframe every N frames. Use 1 for an exact parabola",
@@ -573,8 +802,21 @@ _handle_px = None
 OCCLUDED_ALPHA = 0.15
 
 
+def phys_object(context):
+    """The object the add-on is working on: the pinned one, else the active one.
+
+    Pinning lets the user select something else (typically the empty an aim
+    target lives on) without the panel, preview and gizmo following along.
+    """
+    scene = getattr(context, "scene", None)
+    pinned = getattr(scene, "phys_pinned", None) if scene is not None else None
+    if pinned is not None:
+        return pinned
+    return context.object
+
+
 def _active_props(context):
-    ob = context.object
+    ob = phys_object(context)
     if ob is None:
         return None, None
     props = getattr(ob, "phys_predict", None)
@@ -632,7 +874,7 @@ def _draw_geometry():
         return
 
     p0 = ob.matrix_world.translation.copy()
-    v0 = Vector(props.velocity)
+    v0 = launch_velocity(ob, props)
     t_end = max(props.prediction_time, 1e-6)
 
     draw_pts, sampler = build_trajectory(p0, v0, props, t_end, _drag_k(props, ob))
@@ -649,6 +891,28 @@ def _draw_geometry():
         (arc, (1.0, 0.62, 0.12, 0.95), 2.0),
         (start, (0.95, 0.95, 0.95, 1.0), 0.0),
     ]
+
+    # With a target driving the aim there is no handle, so show what it points at.
+    target = aim_target(ob, props)
+    if target is not None:
+        tp = target.matrix_world.translation
+        aim = batch_for_shader(
+            shader, 'LINES', {"pos": [p0.to_tuple(), tp.to_tuple()]})
+        drawables.append((aim, (1.0, 0.45, 0.1, 0.45), 1.0))
+        tip = batch_for_shader(shader, 'POINTS', {"pos": [tp.to_tuple()]})
+        drawables.append((tip, (1.0, 0.45, 0.1, 0.9), 0.0))
+
+    # Where each burn lights and cuts out, so the staging reads off the arc.
+    burn_pts = []
+    for b in props.burns:
+        if not b.enabled or b.start >= t_end:
+            continue
+        burn_pts.append(sampler(b.start).to_tuple())
+        burn_pts.append(sampler(min(b.start + b.duration, t_end)).to_tuple())
+    if burn_pts:
+        marks = batch_for_shader(shader, 'POINTS', {"pos": burn_pts})
+        drawables.append((marks, (0.35, 0.65, 1.0, 0.95), 0.0))
+
     if props.ghost:
         ghost_mat = aligned_matrix(ob, props, marker_vec, velocity_at(sampler, t_end))
         segs = _ghost_segments(ob, ghost_mat, context)
@@ -699,7 +963,7 @@ def _draw_text():
         return
 
     p0 = ob.matrix_world.translation.copy()
-    v0 = Vector(props.velocity)
+    v0 = launch_velocity(ob, props)
     t_end = max(props.prediction_time, 1e-6)
     _, sampler = build_trajectory(p0, v0, props, t_end, _drag_k(props, ob))
     marker = sampler(t_end)
@@ -753,16 +1017,27 @@ class PHYS_GT_velocity_handle(Gizmo):
     bl_idname = "PHYS_GT_velocity_handle"
 
     def _props(self, context):
-        return context.object.phys_predict
+        return phys_object(context).phys_predict
 
     def _origin(self, context):
-        return context.object.matrix_world.translation.copy()
+        return phys_object(context).matrix_world.translation.copy()
 
     def _scale(self, context):
         return max(self._props(context).display_scale, 1e-4)
 
     def handle_position(self, context):
-        return self._origin(context) + Vector(self._props(context).velocity) * self._scale(context)
+        p = self._props(context)
+        origin = self._origin(context)
+        target = aim_target(phys_object(context), p)
+        if target is not None:
+            return target.matrix_world.translation.copy()
+        v = Vector(p.velocity)
+        if p.lock_speed:
+            # Locked speed means the handle only carries direction, so its
+            # distance is free and kept in handle_reach.
+            d = v.normalized() if v.length > 1e-9 else Vector((0.0, 0.0, 1.0))
+            return origin + d * p.handle_reach
+        return origin + v * self._scale(context)
 
     def setup(self):
         if not hasattr(self, "custom_shape"):
@@ -786,6 +1061,7 @@ class PHYS_GT_velocity_handle(Gizmo):
     def invoke(self, context, event):
         p = self._props(context)
         self._start_velocity = Vector(p.velocity)
+        self._start_reach = p.handle_reach
         self._start_time = p.prediction_time
         # Integrate per-event mouse deltas into the handle position so holding
         # Shift can scale movement down without jumping.
@@ -801,6 +1077,7 @@ class PHYS_GT_velocity_handle(Gizmo):
         if cancel:
             p = self._props(context)
             p.velocity = self._start_velocity
+            p.handle_reach = self._start_reach
             p.prediction_time = self._start_time
         _tag_view3d_redraw(context)
 
@@ -834,12 +1111,15 @@ class PHYS_GT_velocity_handle(Gizmo):
         if proj is not None and self._last_proj is not None:
             factor = 0.1 if event.shift else 1.0
             self._handle = self._handle + (proj - self._last_proj) * factor
-            new_vel = (self._handle - origin) / self._scale(context)
+            offset = self._handle - origin
             if p.lock_speed:
-                if new_vel.length > 1e-9:
-                    p.velocity = new_vel.normalized() * p.locked_speed
+                # Direction from the drag, distance kept as-is: the handle can be
+                # parked wherever it reads best without changing the speed.
+                if offset.length > 1e-9:
+                    p.velocity = offset.normalized() * p.locked_speed
+                    p.handle_reach = max(offset.length, 0.01)
             else:
-                p.velocity = new_vel
+                p.velocity = offset / self._scale(context)
         if proj is not None:
             self._last_proj = proj
 
@@ -868,7 +1148,7 @@ class PHYS_GGT_velocity(GizmoGroup):
 
     @classmethod
     def poll(cls, context):
-        ob = context.object
+        ob = phys_object(context)
         return ob is not None and getattr(ob, "phys_predict", None) is not None \
             and ob.phys_predict.show_preview
 
@@ -883,6 +1163,10 @@ class PHYS_GGT_velocity(GizmoGroup):
         self.handle = gz
 
     def refresh(self, context):
+        # With a target object driving the aim there is nothing to drag, so the
+        # handle steps aside rather than sitting on the target doing nothing.
+        ob = phys_object(context)
+        self.handle.hide = aim_target(ob, ob.phys_predict) is not None
         self.handle.matrix_basis = Matrix.Translation(self.handle.handle_position(context))
 
 
@@ -900,7 +1184,7 @@ class PHYS_OT_scrub(Operator):
         if context.area is None or context.area.type != 'VIEW_3D':
             self.report({'WARNING'}, "Run this from the 3D Viewport")
             return {'CANCELLED'}
-        ob = context.object
+        ob = phys_object(context)
         if ob is None:
             self.report({'WARNING'}, "No active object")
             return {'CANCELLED'}
@@ -914,7 +1198,7 @@ class PHYS_OT_scrub(Operator):
         return 1.0 / scene_fps(context.scene)
 
     def _update_header(self, context):
-        props = context.object.phys_predict
+        props = phys_object(context).phys_predict
         fps = scene_fps(context.scene)
         frame = context.scene.frame_current + round(props.prediction_time * fps)
         context.area.header_text_set(
@@ -929,7 +1213,7 @@ class PHYS_OT_scrub(Operator):
         _tag_view3d_redraw(context)
 
     def modal(self, context, event):
-        props = context.object.phys_predict
+        props = phys_object(context).phys_predict
 
         if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and event.value == 'PRESS':
             mult = 0.2 if event.shift else (5.0 if event.ctrl else 1.0)
@@ -953,6 +1237,73 @@ class PHYS_OT_scrub(Operator):
         return {'PASS_THROUGH'}
 
 
+class PHYS_OT_pin(Operator):
+    bl_idname = "phys.pin_object"
+    bl_label = "Pin Object"
+    bl_description = ("Keep working on this object when the selection changes, so "
+                      "the panel and preview stay put while you move something "
+                      "else (an aim target, say). Click again to unpin")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None and phys_object(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        if scene.phys_pinned is not None:
+            scene.phys_pinned = None
+        else:
+            # Pin the active object, not phys_object: with nothing pinned yet
+            # they are the same, and this reads as "pin what I am looking at".
+            scene.phys_pinned = context.object
+        _tag_view3d_redraw(context)
+        return {'FINISHED'}
+
+
+class PHYS_OT_burn_add(Operator):
+    bl_idname = "phys.burn_add"
+    bl_label = "Add Burn"
+    bl_description = "Add a thrust burn to the trajectory"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return phys_object(context) is not None
+
+    def execute(self, context):
+        props = phys_object(context).phys_predict
+        burn = props.burns.add()
+        # Start where the previous burn ended, so staging a booster and a motor
+        # is two clicks and one edit rather than arithmetic.
+        if len(props.burns) > 1:
+            prev = props.burns[-2]
+            burn.start = prev.start + prev.duration
+        _tag_view3d_redraw(context)
+        return {'FINISHED'}
+
+
+class PHYS_OT_burn_remove(Operator):
+    bl_idname = "phys.burn_remove"
+    bl_label = "Remove Burn"
+    bl_description = "Remove this thrust burn"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: IntProperty(default=0)
+
+    @classmethod
+    def poll(cls, context):
+        return phys_object(context) is not None
+
+    def execute(self, context):
+        props = phys_object(context).phys_predict
+        if 0 <= self.index < len(props.burns):
+            props.burns.remove(self.index)
+            _tag_view3d_redraw(context)
+            return {'FINISHED'}
+        return {'CANCELLED'}
+
+
 class PHYS_OT_apply(Operator):
     bl_idname = "phys.apply_prediction"
     bl_label = "Apply as Keyframes"
@@ -962,17 +1313,17 @@ class PHYS_OT_apply(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None
+        return phys_object(context) is not None
 
     def execute(self, context):
-        ob = context.object
+        ob = phys_object(context)
         props = ob.phys_predict
         scene = context.scene
         fps = scene_fps(scene)
 
         start_frame = scene.frame_current
         p0 = ob.matrix_world.translation.copy()
-        v0 = Vector(props.velocity)
+        v0 = launch_velocity(ob, props)
         t_end = props.prediction_time
 
         if t_end <= 0.0:
@@ -1053,10 +1404,10 @@ class PHYS_OT_to_rigid_body(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None
+        return phys_object(context) is not None
 
     def execute(self, context):
-        ob = context.object
+        ob = phys_object(context)
         props = ob.phys_predict
         scene = context.scene
         fps = scene_fps(scene)
@@ -1067,13 +1418,20 @@ class PHYS_OT_to_rigid_body(Operator):
 
         F = scene.frame_current
         p0 = ob.matrix_world.translation.copy()
-        v0 = Vector(props.velocity)
+        v0 = launch_velocity(ob, props)
 
         if ob.parent is not None:
             self.report(
                 {'WARNING'},
                 "Object is parented: the rigid body simulates in world space and may "
                 "not match the parent's transform.",
+            )
+
+        if any(b.enabled for b in props.burns):
+            self.report(
+                {'WARNING'},
+                "Thrust burns are not transferred: the rigid body gets the launch "
+                "velocity only, so it will fall short of the previewed path.",
             )
 
         # Rigid body gravity comes from the scene, scene-wide. Warn if it differs
@@ -1215,25 +1573,80 @@ class PHYS_PT_panel(Panel):
     bl_category = "PhysAnim"
     bl_label = "PhysAnim"
 
+    def _draw_burn(self, context, layout, burn, index, fps):
+        box = layout.box()
+
+        header = box.row(align=True)
+        header.prop(burn, "enabled", text="")
+        header.label(text="Burn {}".format(index + 1))
+        header.operator("phys.burn_remove", text="", icon='X', emboss=False).index = index
+
+        col = box.column(align=True)
+        col.active = burn.enabled
+        col.prop(burn, "start")
+        col.prop(burn, "duration")
+
+        col = box.column(align=True)
+        col.active = burn.enabled
+        col.prop(burn, "direction_mode", text="")
+        if burn.direction_mode == 'WORLD':
+            col.prop(burn, "direction", text="")
+
+        col = box.column(align=True)
+        col.active = burn.enabled
+        col.prop(burn, "input_mode", text="")
+        # Show the quantity that isn't being authored, since it is the one that
+        # moves when the duration changes.
+        if burn.input_mode == 'DELTA_V':
+            col.prop(burn, "delta_v")
+            col.label(text="= {:.2f} m/s² for {:.2f} s".format(
+                burn.magnitude, burn.duration))
+        else:
+            col.prop(burn, "magnitude")
+            col.label(text="= {:.2f} m/s over {:.2f} s".format(
+                burn.delta_v, burn.duration))
+
+        start_frame = context.scene.frame_current
+        f0 = start_frame + round(burn.start * fps)
+        f1 = start_frame + round((burn.start + burn.duration) * fps)
+        box.label(text="Frames {}-{}".format(f0, f1), icon='TIME')
+
     def draw(self, context):
         layout = self.layout
-        ob = context.object
+        ob = phys_object(context)
 
         if ob is None:
             layout.label(text="Select an object", icon='INFO')
             return
 
         props = ob.phys_predict
+        fps = scene_fps(context.scene)
+        pinned = context.scene.phys_pinned
 
         row = layout.row(align=True)
         row.prop(props, "show_preview", toggle=True, icon='HIDE_OFF')
         sub = row.row(align=True)
         sub.active = props.show_preview
         sub.prop(props, "ghost", text="", toggle=True, icon='GHOST_ENABLED')
+        row.operator("phys.pin_object", text="", depress=pinned is not None,
+                     icon='PINNED' if pinned is not None else 'UNPINNED')
+
+        if pinned is not None:
+            layout.label(text="Pinned to {}".format(pinned.name), icon='PINNED')
+
+        target = aim_target(ob, props)
+        v0 = launch_velocity(ob, props)
+
+        layout.prop(props, "target", icon='EMPTY_ARROWS')
 
         col = layout.column(align=True)
-        col.enabled = not props.lock_speed
+        col.enabled = not props.lock_speed and target is None
         col.prop(props, "velocity")
+        if target is not None:
+            col.label(text="Aimed at {}: {:.2f}, {:.2f}, {:.2f} m/s".format(
+                target.name, v0.x, v0.y, v0.z), icon='TRACKING')
+        elif props.target is not None:
+            col.label(text="Aim target must be another object", icon='ERROR')
 
         row = layout.row(align=True)
         row.prop(props, "lock_speed", text="",
@@ -1241,7 +1654,7 @@ class PHYS_PT_panel(Panel):
         if props.lock_speed:
             row.prop(props, "locked_speed", text="Launch Speed")
         else:
-            row.label(text="Launch speed: {:.2f} m/s".format(Vector(props.velocity).length))
+            row.label(text="Launch speed: {:.2f} m/s".format(v0.length))
 
         col = layout.column(align=True)
         col.prop(props, "gravity")
@@ -1272,6 +1685,16 @@ class PHYS_PT_panel(Panel):
             box.prop(props, "restitution", slider=True)
 
         box = layout.box()
+        header = box.row(align=True)
+        header.label(text="Thrust", icon='FORCE_FORCE')
+        header.operator("phys.burn_add", text="", icon='ADD')
+        for i, burn in enumerate(props.burns):
+            self._draw_burn(context, box, burn, i, fps)
+        if props.burns:
+            total = sum(b.delta_v for b in props.burns if b.enabled)
+            box.label(text="Total thrust delta-v: {:.2f} m/s".format(total))
+
+        box = layout.box()
         box.prop(props, "align_to_motion")
         if props.align_to_motion:
             col = box.column(align=True)
@@ -1283,7 +1706,6 @@ class PHYS_PT_panel(Panel):
 
         layout.prop(props, "prediction_time")
 
-        fps = scene_fps(context.scene)
         frame = context.scene.frame_current + round(props.prediction_time * fps)
         layout.label(text="Predicted frame: {}".format(frame), icon='TIME')
 
@@ -1293,7 +1715,9 @@ class PHYS_PT_panel(Panel):
 
         box = layout.box()
         box.label(text="Display", icon='HIDE_OFF')
-        box.prop(props, "display_scale")
+        # With the speed locked the handle carries direction only, so its
+        # distance is a free number rather than a scale factor on the velocity.
+        box.prop(props, "handle_reach" if props.lock_speed else "display_scale")
         box.prop(props, "resolution")
 
         layout.separator()
@@ -1312,8 +1736,12 @@ class PHYS_PT_panel(Panel):
 # --------------------------------------------------------------------------- #
 
 classes = (
+    PHYS_PG_burn,
     PHYS_PG_props,
     PHYS_OT_scrub,
+    PHYS_OT_pin,
+    PHYS_OT_burn_add,
+    PHYS_OT_burn_remove,
     PHYS_OT_apply,
     PHYS_OT_to_rigid_body,
     PHYS_PT_panel,
@@ -1326,6 +1754,15 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Object.phys_predict = PointerProperty(type=PHYS_PG_props)
+    # The pin is working state rather than object data, so it lives on the scene
+    # (and is saved with the file). Deleting the object clears it automatically.
+    bpy.types.Scene.phys_pinned = PointerProperty(
+        name="Pinned Object",
+        description="Object the PhysAnim panel and preview stay on, regardless "
+                    "of what is selected",
+        type=bpy.types.Object,
+        update=_redraw_update,
+    )
 
     global _handle_view, _handle_px
     _handle_view = bpy.types.SpaceView3D.draw_handler_add(
@@ -1343,6 +1780,7 @@ def unregister():
         bpy.types.SpaceView3D.draw_handler_remove(_handle_px, 'WINDOW')
         _handle_px = None
 
+    del bpy.types.Scene.phys_pinned
     del bpy.types.Object.phys_predict
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
